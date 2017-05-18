@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2003 Bilibili
  * Copyright (c) 2003 Fabrice Bellard
  * Copyright (c) 2013 Zhang Rui <bbcallen@gmail.com>
  *
@@ -69,6 +70,9 @@
 #include "ijkmeta.h"
 #include "ijkversion.h"
 #include <stdatomic.h>
+#if defined(__ANDROID__)
+#include "ijksoundtouch/ijksoundtouch_wrap.h"
+#endif
 
 #ifndef AV_CODEC_FLAG2_FAST
 #define AV_CODEC_FLAG2_FAST CODEC_FLAG2_FAST
@@ -805,13 +809,22 @@ static void stream_close(FFPlayer *ffp)
     frame_queue_destory(&is->pictq);
     frame_queue_destory(&is->sampq);
     frame_queue_destory(&is->subpq);
+    SDL_DestroyCond(is->audio_accurate_seek_cond);
+    SDL_DestroyCond(is->video_accurate_seek_cond);
     SDL_DestroyCond(is->continue_read_thread);
+    SDL_DestroyMutex(is->accurate_seek_mutex);
     SDL_DestroyMutex(is->play_mutex);
 #if !CONFIG_AVFILTER
     sws_freeContext(is->img_convert_ctx);
 #endif
 #ifdef FFP_MERGE
     sws_freeContext(is->sub_convert_ctx);
+#endif
+
+#if defined(__ANDROID__)
+    if (ffp->soundtouch_enable && is->handle != NULL) {
+        ijk_soundtouch_destroy(is->handle);
+    }
 #endif
     av_free(is->filename);
     av_free(is);
@@ -1267,6 +1280,59 @@ static int queue_picture(FFPlayer *ffp, AVFrame *src_frame, double pts, double d
 {
     VideoState *is = ffp->is;
     Frame *vp;
+    int video_accurate_seek_fail = 0;
+    int64_t video_seek_pos = 0;
+
+    if (ffp->enable_accurate_seek && is->video_accurate_seek_req && !is->seek_req) {
+        if (!isnan(pts)) {
+            video_seek_pos = is->seek_pos;
+            if (pts * 1000 * 1000 < is->seek_pos) {
+                if (is->drop_vframe_count == 0) {
+                    av_log(NULL, AV_LOG_INFO, "video accurate_seek start, is->seek_pos=%lld, pts=%lf\n", is->seek_pos, pts);
+                }
+                is->drop_vframe_count++;
+                if (is->drop_vframe_count < MAX_KEY_FRAME_INTERVAL) {
+                    return 1;  // drop some old frame when do accurate seek
+                } else {
+                    av_log(NULL, AV_LOG_WARNING, "video accurate_seek is error, is->drop_vframe_count=%d\n", is->drop_vframe_count);
+                    video_accurate_seek_fail = 1;  // if KEY_FRAME interval too big, disable accurate seek
+                }
+            } else {
+                av_log(NULL, AV_LOG_INFO, "video accurate_seek is ok, is->drop_vframe_count =%d, is->seek_pos=%lld, pts=%lf\n", is->drop_vframe_count, is->seek_pos, pts);
+                if (video_seek_pos == is->seek_pos) {
+                    is->drop_vframe_count       = 0;
+                    SDL_LockMutex(is->accurate_seek_mutex);
+                    is->video_accurate_seek_req = 0;
+                    SDL_CondSignal(is->audio_accurate_seek_cond);
+                    if (video_seek_pos == is->seek_pos && is->audio_accurate_seek_req && !is->abort_request)
+                        SDL_CondWait(is->video_accurate_seek_cond, is->accurate_seek_mutex);
+
+                    ffp_notify_msg2(ffp, FFP_MSG_ACCURATE_SEEK_COMPLETE, (int)(pts * 1000));
+                    if (video_seek_pos != is->seek_pos && !is->abort_request) {
+                        is->video_accurate_seek_req = 1;
+                        SDL_UnlockMutex(is->accurate_seek_mutex);
+                        return 1;
+                    }
+
+                    SDL_UnlockMutex(is->accurate_seek_mutex);
+                }
+            }
+        } else {
+            video_accurate_seek_fail = 1;
+        }
+
+        if (video_accurate_seek_fail) {
+            if (!isnan(pts)) {
+                ffp_notify_msg2(ffp, FFP_MSG_ACCURATE_SEEK_COMPLETE, (int)(pts * 1000));
+            }
+            ffp->enable_accurate_seek   = 0;
+            is->drop_vframe_count       = 0;
+            SDL_LockMutex(is->accurate_seek_mutex);
+            is->video_accurate_seek_req = 0;
+            SDL_CondSignal(is->audio_accurate_seek_cond);
+            SDL_UnlockMutex(is->accurate_seek_mutex);
+        }
+    }
 
 #if defined(DEBUG_SYNC)
     printf("frame_type=%c pts=%0.3f\n",
@@ -1641,6 +1707,8 @@ static int audio_thread(void *arg)
     int got_frame = 0;
     AVRational tb;
     int ret = 0;
+    int audio_accurate_seek_fail = 0;
+    int64_t audio_seek_pos = 0;
 
     if (!frame)
         return AVERROR(ENOMEM);
@@ -1652,6 +1720,58 @@ static int audio_thread(void *arg)
 
         if (got_frame) {
                 tb = (AVRational){1, frame->sample_rate};
+                if (ffp->enable_accurate_seek && is->audio_accurate_seek_req && !is->seek_req) {
+                    double frame_pts = (frame->pts == AV_NOPTS_VALUE) ? NAN : frame->pts * av_q2d(tb);
+                    double audio_clock = 0;
+                    if (!isnan(frame_pts)) {
+                        double samples_duration = (double) frame->nb_samples / frame->sample_rate;
+                        audio_clock = frame_pts + samples_duration;
+                        audio_seek_pos = is->seek_pos;
+                        if (audio_clock * 1000 * 1000 < is->seek_pos) {
+                            if (is->drop_aframe_count == 0) {
+                                av_log(NULL, AV_LOG_INFO, "audio accurate_seek start, is->seek_pos=%lld, audio_clock=%lf\n", is->seek_pos, audio_clock);
+                            }
+                            is->drop_aframe_count++;
+                            if (is->drop_aframe_count < MAX_KEY_FRAME_INTERVAL) {
+                                continue;  // drop some old frame when do accurate seek
+                            } else {
+                                av_log(NULL, AV_LOG_INFO, "audio accurate_seek is error, is->drop_aframe_count=%d\n", is->drop_aframe_count);
+                                audio_accurate_seek_fail = 1;
+                            }
+                        } else {
+                            if (audio_seek_pos == is->seek_pos) {
+                                av_log(NULL, AV_LOG_INFO, "audio accurate_seek is ok, is->drop_aframe_count=%d\n", is->drop_aframe_count);
+                                is->drop_aframe_count       = 0;
+                                SDL_LockMutex(is->accurate_seek_mutex);
+                                is->audio_accurate_seek_req = 0;
+                                SDL_CondSignal(is->video_accurate_seek_cond);
+                                if (audio_seek_pos == is->seek_pos && is->video_accurate_seek_req && !is->abort_request)
+                                    SDL_CondWait(is->audio_accurate_seek_cond, is->accurate_seek_mutex);
+
+                                if (audio_seek_pos != is->seek_pos && !is->abort_request) {
+                                    is->audio_accurate_seek_req = 1;
+                                    SDL_UnlockMutex(is->accurate_seek_mutex);
+                                    continue;
+                                }
+
+                                SDL_UnlockMutex(is->accurate_seek_mutex);
+                            }
+                        }
+                    } else {
+                        audio_accurate_seek_fail = 1;
+                    }
+                    if (audio_accurate_seek_fail) {
+                        if (!isnan(frame_pts)) {
+                            ffp_notify_msg2(ffp, FFP_MSG_ACCURATE_SEEK_COMPLETE, (int)(audio_clock * 1000));
+                        }
+                        ffp->enable_accurate_seek   = 0;
+                        is->drop_aframe_count       = 0;
+                        SDL_LockMutex(is->accurate_seek_mutex);
+                        is->audio_accurate_seek_req = 0;
+                        SDL_CondSignal(is->video_accurate_seek_cond);
+                        SDL_UnlockMutex(is->accurate_seek_mutex);
+                    }
+                }
 
 #if CONFIG_AVFILTER
                 dec_channel_layout = get_valid_channel_layout(frame->channel_layout, av_frame_get_channels(frame));
@@ -1975,6 +2095,7 @@ static int audio_decode_frame(FFPlayer *ffp)
     av_unused double audio_clock0;
     int wanted_nb_samples;
     Frame *af;
+    int translate_time = 1;
 
     if (is->paused || is->step)
         return -1;
@@ -1993,7 +2114,7 @@ static int audio_decode_frame(FFPlayer *ffp)
             return -1;
         }
     }
-
+reload:
     do {
 #if defined(_WIN32) || defined(__APPLE__)
         while (frame_queue_nb_remaining(&is->sampq) == 0) {
@@ -2071,6 +2192,7 @@ static int audio_decode_frame(FFPlayer *ffp)
             }
         }
         av_fast_malloc(&is->audio_buf1, &is->audio_buf1_size, out_size);
+
         if (!is->audio_buf1)
             return AVERROR(ENOMEM);
         len2 = swr_convert(is->swr_ctx, out, out_count, in, af->frame->nb_samples);
@@ -2084,7 +2206,27 @@ static int audio_decode_frame(FFPlayer *ffp)
                 swr_free(&is->swr_ctx);
         }
         is->audio_buf = is->audio_buf1;
-        resampled_data_size = len2 * is->audio_tgt.channels * av_get_bytes_per_sample(is->audio_tgt.fmt);
+        int bytes_per_sample = av_get_bytes_per_sample(is->audio_tgt.fmt);
+        resampled_data_size = len2 * is->audio_tgt.channels * bytes_per_sample;
+#if defined(__ANDROID__)
+        if (ffp->soundtouch_enable && ffp->pf_playback_rate != 1.0f && !is->abort_request) {
+            av_fast_malloc(&is->audio_new_buf, &is->audio_new_buf_size, out_size * translate_time);
+            for (int i = 0; i < (resampled_data_size / 2); i++)
+            {
+                is->audio_new_buf[i] = (is->audio_buf1[i * 2] | (is->audio_buf1[i * 2 + 1] << 8));
+            }
+
+            int ret_len = ijk_soundtouch_translate(is->handle, is->audio_new_buf, (float)(ffp->pf_playback_rate), (float)(1.0f/ffp->pf_playback_rate),
+                    resampled_data_size / 2, bytes_per_sample, is->audio_tgt.channels, af->frame->sample_rate);
+            if (ret_len > 0) {
+                is->audio_buf = (uint8_t*)is->audio_new_buf;
+                resampled_data_size = ret_len;
+            } else {
+                translate_time++;
+                goto reload;
+            }
+        }
+#endif
     } else {
         is->audio_buf = af->frame->data[0];
         resampled_data_size = data_size;
@@ -2133,7 +2275,13 @@ static void sdl_audio_callback(void *opaque, Uint8 *stream, int len)
 
     if (ffp->pf_playback_rate_changed) {
         ffp->pf_playback_rate_changed = 0;
+#if defined(__ANDROID__)
+        if (!ffp->soundtouch_enable) {
+            SDL_AoutSetPlaybackRate(ffp->aout, ffp->pf_playback_rate);
+        }
+#else
         SDL_AoutSetPlaybackRate(ffp->aout, ffp->pf_playback_rate);
+#endif
     }
     if (ffp->pf_playback_volume_changed) {
         ffp->pf_playback_volume_changed = 0;
@@ -2753,7 +2901,7 @@ static int read_thread(void *arg)
     }
     /* offset should be seeked*/
     if (ffp->seek_at_start > 0) {
-        ffp_seek_to_l(ffp, ffp->seek_at_start);
+        ffp_seek_to_l(ffp, (long)(ffp->seek_at_start));
     }
 
     for (;;) {
@@ -2836,6 +2984,18 @@ static int read_thread(void *arg)
             if (is->pause_req)
                 step_to_next_frame_l(ffp);
             SDL_UnlockMutex(ffp->is->play_mutex);
+
+            if (ffp->enable_accurate_seek) {
+                is->drop_aframe_count = 0;
+                is->drop_vframe_count = 0;
+                SDL_LockMutex(is->accurate_seek_mutex);
+                is->audio_accurate_seek_req = 1;
+                is->video_accurate_seek_req = 1;
+                SDL_CondSignal(is->audio_accurate_seek_cond);
+                SDL_CondSignal(is->video_accurate_seek_cond);
+                SDL_UnlockMutex(is->accurate_seek_mutex);
+            }
+
             ffp_notify_msg3(ffp, FFP_MSG_SEEK_COMPLETE, (int)fftime_to_milliseconds(seek_target), ret);
             ffp_toggle_buffering(ffp, 1);
         }
@@ -3034,7 +3194,11 @@ static VideoState *stream_open(FFPlayer *ffp, const char *filename, AVInputForma
     is->iformat = iformat;
     is->ytop    = 0;
     is->xleft   = 0;
-
+#if defined(__ANDROID__)
+    if (ffp->soundtouch_enable) {
+        is->handle = ijk_soundtouch_create();
+    }
+#endif
     /* start video display */
     if (frame_queue_init(&is->pictq, &is->videoq, ffp->pictq_size, 1) < 0)
         goto fail;
@@ -3053,6 +3217,16 @@ static VideoState *stream_open(FFPlayer *ffp, const char *filename, AVInputForma
         goto fail;
     }
 
+    if (!(is->video_accurate_seek_cond = SDL_CreateCond())) {
+        av_log(NULL, AV_LOG_FATAL, "SDL_CreateCond(): %s\n", SDL_GetError());
+        ffp->enable_accurate_seek = 0;
+    }
+
+    if (!(is->audio_accurate_seek_cond = SDL_CreateCond())) {
+        av_log(NULL, AV_LOG_FATAL, "SDL_CreateCond(): %s\n", SDL_GetError());
+        ffp->enable_accurate_seek = 0;
+    }
+
     init_clock(&is->vidclk, &is->videoq.serial);
     init_clock(&is->audclk, &is->audioq.serial);
     init_clock(&is->extclk, &is->extclk.serial);
@@ -3062,6 +3236,7 @@ static VideoState *stream_open(FFPlayer *ffp, const char *filename, AVInputForma
     is->av_sync_type = ffp->av_sync_type;
 
     is->play_mutex = SDL_CreateMutex();
+    is->accurate_seek_mutex = SDL_CreateMutex();
     ffp->is = is;
     is->pause_req = !ffp->start_on_prepared;
 
@@ -3407,8 +3582,10 @@ static int app_func_event(AVApplicationContext *h, int message ,void *data, size
         return 0;
     if (message == AVAPP_EVENT_IO_TRAFFIC && sizeof(AVAppIOTraffic) == size) {
         AVAppIOTraffic *event = (AVAppIOTraffic *)(intptr_t)data;
-        if (event->bytes > 0)
+        if (event->bytes > 0) {
+            ffp->stat.byte_count += event->bytes;
             SDL_SpeedSampler2Add(&ffp->stat.tcp_read_sampler, event->bytes);
+        }
     } else if (message == AVAPP_EVENT_ASYNC_STATISTIC && sizeof(AVAppAsyncStatistic) == size) {
         AVAppAsyncStatistic *statistic =  (AVAppAsyncStatistic *) (intptr_t)data;
         ffp->stat.buf_backwards = statistic->buf_backwards;
@@ -3416,6 +3593,41 @@ static int app_func_event(AVApplicationContext *h, int message ,void *data, size
         ffp->stat.buf_capacity = statistic->buf_capacity;
     }
     return inject_callback(ffp->inject_opaque, message , data, size);
+}
+
+static int ijkio_app_func_event(IjkIOApplicationContext *h, int message ,void *data, size_t size)
+{
+    if (!h || !h->opaque || !data)
+        return 0;
+
+    FFPlayer *ffp = (FFPlayer *)h->opaque;
+    if (!ffp->ijkio_inject_opaque)
+        return 0;
+
+    if (message == IJKIOAPP_EVENT_CACHE_STATISTIC && sizeof(IjkIOAppCacheStatistic) == size) {
+        IjkIOAppCacheStatistic *statistic =  (IjkIOAppCacheStatistic *) (intptr_t)data;
+        ffp->stat.cache_physical_pos      = statistic->cache_physical_pos;
+        ffp->stat.cache_buf_forwards      = statistic->cache_buf_forwards;
+        ffp->stat.cache_file_pos          = statistic->cache_file_pos;
+        ffp->stat.cache_count_bytes       = statistic->cache_count_bytes;
+    }
+
+    return inject_callback(ffp->inject_opaque, IJKIOAPP_EVENT_CACHE_STATISTIC, data, size);
+}
+
+void *ffp_set_ijkio_inject_opaque(FFPlayer *ffp, void *opaque)
+{
+    if (!ffp)
+        return NULL;
+    void *prev_weak_thiz = ffp->ijkio_inject_opaque;
+    ffp->ijkio_inject_opaque = opaque;
+
+    ijkio_manager_destroyp(&ffp->ijkio_manager_ctx);
+    ijkio_manager_create(&ffp->ijkio_manager_ctx, ffp);
+    ijkio_manager_set_callback(ffp->ijkio_manager_ctx, ijkio_app_func_event);
+    ffp_set_option_int(ffp, FFP_OPT_CATEGORY_FORMAT, "ijkiomanager", (int64_t)(intptr_t)ffp->ijkio_manager_ctx);
+
+    return prev_weak_thiz;
 }
 
 void *ffp_set_inject_opaque(FFPlayer *ffp, void *opaque)
@@ -3643,6 +3855,15 @@ int ffp_stop_l(FFPlayer *ffp)
     }
 
     msg_queue_abort(&ffp->msg_queue);
+    if (ffp->enable_accurate_seek && is && is->accurate_seek_mutex
+        && is->audio_accurate_seek_cond && is->video_accurate_seek_cond) {
+        SDL_LockMutex(is->accurate_seek_mutex);
+        is->audio_accurate_seek_req = 0;
+        is->video_accurate_seek_req = 0;
+        SDL_CondSignal(is->audio_accurate_seek_cond);
+        SDL_CondSignal(is->video_accurate_seek_cond);
+        SDL_UnlockMutex(is->accurate_seek_mutex);
+    }
     return 0;
 }
 
@@ -3860,7 +4081,7 @@ void ffp_track_statistic_l(FFPlayer *ffp, AVStream *st, PacketQueue *q, FFTrackC
         cache->packets = q->nb_packets;
     }
 
-    if (st && st->time_base.den > 0 && st->time_base.num > 0) {
+    if (q && st && st->time_base.den > 0 && st->time_base.num > 0) {
         cache->duration = q->duration * av_q2d(st->time_base) * 1000;
     }
 }
@@ -4228,6 +4449,25 @@ int64_t ffp_get_property_int64(FFPlayer *ffp, int id, int64_t default_value)
             return ffp->stat.buf_capacity;
         case FFP_PROP_INT64_LATEST_SEEK_LOAD_DURATION:
             return ffp ? ffp->stat.latest_seek_load_duration : default_value;
+        case FFP_PROP_INT64_TRAFFIC_STATISTIC_BYTE_COUNT:
+            return ffp ? ffp->stat.byte_count : default_value;
+        case FFP_PROP_INT64_CACHE_STATISTIC_PHYSICAL_POS:
+            if (!ffp)
+                return default_value;
+            return ffp->stat.cache_physical_pos;
+       case FFP_PROP_INT64_CACHE_STATISTIC_BUF_FORWARDS:
+            if (!ffp)
+                return default_value;
+            return ffp->stat.cache_buf_forwards;
+
+       case FFP_PROP_INT64_CACHE_STATISTIC_FILE_POS:
+            if (!ffp)
+                return default_value;
+            return ffp->stat.cache_file_pos;
+       case FFP_PROP_INT64_CACHE_STATISTIC_COUNT_BYTES:
+            if (!ffp)
+                return default_value;
+            return ffp->stat.cache_count_bytes;
         default:
             return default_value;
     }
