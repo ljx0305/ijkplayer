@@ -486,6 +486,9 @@ typedef struct FFStatistic
     int64_t cache_buf_forwards;
     int64_t cache_file_pos;
     int64_t cache_count_bytes;
+    int drop_frame_count;
+    int decode_frame_count;
+    float drop_frame_rate;
 } FFStatistic;
 
 #define FFP_TCP_READ_SAMPLE_RANGE 2000
@@ -632,6 +635,7 @@ typedef struct FFPlayer {
     int packet_buffering;
     int pictq_size;
     int max_fps;
+    int startup_volume;
 
     int videotoolbox;
     int vtb_max_frame_width;
@@ -679,6 +683,7 @@ typedef struct FFPlayer {
     IjkIOManagerContext *ijkio_manager_ctx;
 
     int enable_accurate_seek;
+    int mediacodec_sync;
 } FFPlayer;
 
 #define fftime_to_milliseconds(ts) (av_rescale(ts, 1000, AV_TIME_BASE))
